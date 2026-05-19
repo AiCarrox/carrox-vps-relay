@@ -1,0 +1,38 @@
+services:
+  vps-relay:
+    image: vps-relay:latest
+    build:
+      context: .
+      args:
+        ACME_EMAIL: bootstrap@vps-relay.local
+    container_name: vps-relay
+    restart: unless-stopped
+    # Share host network + PID so the container can:
+    #   - listen on 127.0.0.1:8787 (consumed by the host nginx panel vhost)
+    #   - reload the host nginx master (`kill -HUP <pid>`)
+    network_mode: host
+    pid: host
+    # Allow `kill -HUP` to host-root nginx master.
+    # KILL capability + opting out of the docker-default apparmor profile
+    # is the minimum needed for this on modern Ubuntu / Docker installs.
+    cap_add:
+      - KILL
+    security_opt:
+      - apparmor=unconfined
+    volumes:
+      # Shared with host nginx — gives the container access to sbin/conf/ssl/pid
+      - /usr/local/nginx:/usr/local/nginx
+      # Project config — keys.json + per-user CF tokens (read-write, keys auto-managed)
+      - /etc/vps-relay:/etc/vps-relay
+      # acme.sh account + certificate state, persisted across container restarts
+      - acme_data:/root/.acme.sh
+    environment:
+      - TZ=Asia/Shanghai
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8787/api/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  acme_data:

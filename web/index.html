@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>vps-relay</title>
+<script defer src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js"></script>
+<style>
+  :root {
+    --bg: #f7f8fa; --card: #fff; --border: #e1e4e8; --muted: #6a737d;
+    --primary: #1f6feb; --danger: #cf222e; --ok: #1a7f37; --warn: #b08800;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         margin: 0; padding: 2rem; background: var(--bg); color: #24292f; }
+  .wrap { max-width: 900px; margin: 0 auto; }
+  h1 { margin: 0 0 0.25rem 0; }
+  .sub { color: var(--muted); margin-bottom: 1.5rem; font-size: 0.9rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+          padding: 1.25rem 1.5rem; margin-bottom: 1.25rem; }
+  .card h2 { margin: 0 0 1rem 0; font-size: 1.05rem; display: flex; align-items: center; gap: 0.5rem; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 0.75rem; font-weight: 600; }
+  .pill.ok { background: #dafbe1; color: var(--ok); }
+  .pill.warn { background: #fff8c5; color: var(--warn); }
+  .pill.err { background: #ffebe9; color: var(--danger); }
+  .pill.muted { background: #eaeef2; color: var(--muted); }
+  label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.25rem; }
+  input, select { width: 100%; padding: 0.5rem; border: 1px solid var(--border); border-radius: 4px;
+                  font-size: 0.95rem; font-family: inherit; }
+  input:focus, select:focus { outline: 2px solid var(--primary); outline-offset: -1px; border-color: var(--primary); }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+  .row3 { display: grid; grid-template-columns: 1fr 1.6fr auto; gap: 0.75rem; align-items: end; }
+  button { padding: 0.5rem 1rem; background: var(--primary); color: #fff; border: 0; border-radius: 4px;
+           font-size: 0.9rem; cursor: pointer; }
+  button:hover { filter: brightness(1.05); }
+  button:disabled { background: #94a3b8; cursor: not-allowed; }
+  button.secondary { background: #fff; color: #24292f; border: 1px solid var(--border); }
+  button.danger { background: var(--danger); }
+  .site { padding: 0.85rem 1rem; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.65rem; }
+  .site.disabled { opacity: 0.6; }
+  .site-head { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+  .site-head .dom { font-weight: 600; }
+  .site-head .ups { color: var(--muted); font-size: 0.85rem; }
+  .site-meta { color: var(--muted); font-size: 0.8rem; margin-top: 0.35rem; }
+  .actions { margin-top: 0.65rem; display: flex; gap: 0.5rem; }
+  .err-banner { background: #ffebe9; color: var(--danger); padding: 0.5rem 0.75rem; border-radius: 4px; margin-bottom: 0.75rem; font-size: 0.85rem; }
+  .ok-banner { background: #dafbe1; color: var(--ok); padding: 0.5rem 0.75rem; border-radius: 4px; margin-bottom: 0.75rem; font-size: 0.85rem; }
+  .muted { color: var(--muted); }
+  .right { float: right; }
+  .toolbar { display: flex; gap: 0.5rem; align-items: center; }
+  .small { font-size: 0.8rem; }
+  code { background: #f3f4f6; padding: 0 4px; border-radius: 3px; font-size: 0.85em; }
+  .login-card { max-width: 420px; margin: 6rem auto; }
+</style>
+</head>
+<body>
+
+<div x-data="app()" x-init="boot()" x-cloak>
+
+  <!-- LOGIN -->
+  <template x-if="!loggedIn">
+    <div class="wrap">
+      <div class="card login-card">
+        <h2>🔐 vps-relay 登录</h2>
+        <p class="muted small">请输入密钥登录。</p>
+        <template x-if="loginErr">
+          <div class="err-banner" x-text="loginErr"></div>
+        </template>
+        <label>Admin Token</label>
+        <input type="password" x-model="loginToken" @keydown.enter="doLogin()" />
+        <div style="margin-top:0.75rem;">
+          <button @click="doLogin()" :disabled="loginBusy" x-text="loginBusy ? '验证中…' : '登录'"></button>
+        </div>
+      </div>
+    </div>
+  </template>
+
+  <!-- PANEL -->
+  <template x-if="loggedIn">
+    <div class="wrap">
+      <h1>vps-relay <span class="pill muted small" x-text="'v' + (version||'?')"></span></h1>
+      <div class="sub">
+        反代加速面板 ·
+        <span x-text="edgeIp ? '边缘 IP ' + edgeIp : '边缘 IP 探测中…'"></span>
+        <span class="right">
+          <button class="secondary small" @click="logout()">退出</button>
+        </span>
+      </div>
+
+      <template x-if="flash">
+        <div :class="flashOk ? 'ok-banner' : 'err-banner'" x-text="flash"></div>
+      </template>
+
+      <!-- ① CF Token -->
+      <div class="card">
+        <h2>① Cloudflare 凭据
+          <template x-if="cfStatus.configured">
+            <span class="pill ok">已配置</span>
+          </template>
+          <template x-if="!cfStatus.configured">
+            <span class="pill err">未配置</span>
+          </template>
+        </h2>
+        <template x-if="cfStatus.configured && !cfEdit">
+          <div>
+            <span class="muted">Token: </span><code x-text="cfStatus.masked"></code>
+            <span class="right">
+              <button class="secondary small" @click="cfEdit=true; cfTokenInput=''">更新</button>
+            </span>
+          </div>
+        </template>
+        <template x-if="!cfStatus.configured || cfEdit">
+          <div>
+            <p class="muted small">需要 Zone:Read + DNS:Edit 权限。</p>
+            <label>API Token</label>
+            <input type="password" x-model="cfTokenInput" />
+            <div style="margin-top:0.65rem;">
+              <button @click="saveCfToken()" :disabled="cfBusy" x-text="cfBusy ? '校验中…' : '保存并校验'"></button>
+              <template x-if="cfStatus.configured">
+                <button class="secondary" @click="cfEdit=false; cfTokenInput=''">取消</button>
+              </template>
+            </div>
+          </div>
+        </template>
+      </div>
+
+      <!-- ② New reverse-proxy -->
+      <div class="card" :style="cfStatus.configured ? '' : 'opacity:0.55; pointer-events:none;'">
+        <h2>② 新建反代</h2>
+        <template x-if="!cfStatus.configured">
+          <p class="muted small">配置 Cloudflare Token 后可用。</p>
+        </template>
+        <div class="row3" x-show="cfStatus.configured">
+          <div>
+            <label>加速域名</label>
+            <div style="display:flex; gap:0.4rem;">
+              <input type="text" x-model="newSub" placeholder="api" style="flex:1.2;" />
+              <select x-model="newZone" style="flex:1.6;">
+                <option value="">选择 Zone…</option>
+                <template x-for="z in zones" :key="z.id">
+                  <option :value="z.name" x-text="z.name"></option>
+                </template>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label>上游地址</label>
+            <input type="text" x-model="newUpstream" placeholder="https://origin.example.com" />
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button @click="createSite()" :disabled="creating || !newSub || !newZone || !newUpstream"
+                    x-text="creating ? '创建中…' : '一键创建'"></button>
+          </div>
+        </div>
+      </div>
+
+      <!-- ③ Sites list -->
+      <div class="card">
+        <h2>③ 已有站点
+          <span class="pill muted small" x-text="(sites.length || 0) + ' 项'"></span>
+          <span class="right">
+            <button class="secondary small" @click="reloadSites()">刷新</button>
+          </span>
+        </h2>
+        <template x-if="sitesWarnings.length">
+          <div class="err-banner">
+            <strong>warn:</strong>
+            <ul style="margin: 0.25rem 0 0 1rem;">
+              <template x-for="w in sitesWarnings"><li x-text="w"></li></template>
+            </ul>
+          </div>
+        </template>
+        <template x-if="sites.length === 0">
+          <p class="muted small">暂无托管站点。在上方表单创建第一个。</p>
+        </template>
+        <template x-for="s in sites" :key="s.domain">
+          <div class="site" :class="{disabled: !s.enabled}">
+            <div class="site-head">
+              <span class="dom" x-text="s.domain"></span>
+              <span class="ups">→ <span x-text="s.upstream"></span></span>
+              <template x-if="s.enabled"><span class="pill ok">启用</span></template>
+              <template x-if="!s.enabled"><span class="pill muted">停用</span></template>
+              <template x-if="s.cert_days_left > 14"><span class="pill ok small" x-text="'cert ' + s.cert_days_left + 'd'"></span></template>
+              <template x-if="s.cert_days_left > 0 && s.cert_days_left <= 14"><span class="pill warn small" x-text="'cert ' + s.cert_days_left + 'd'"></span></template>
+              <template x-if="s.cert_days_left <= 0"><span class="pill err small">证书已过期</span></template>
+              <template x-if="s.upstream_ok"><span class="pill ok small">upstream</span></template>
+              <template x-if="!s.upstream_ok"><span class="pill err small">upstream</span></template>
+              <template x-if="s.edge_ok"><span class="pill ok small">edge</span></template>
+              <template x-if="!s.edge_ok"><span class="pill err small">edge</span></template>
+            </div>
+            <div class="site-meta">
+              <span x-text="'CF ' + (s.cf_zone || '?')"></span>
+              ·
+              <span x-text="'DNS ' + (s.dns_resolved_to || '—')"></span>
+              ·
+              <span x-text="'created ' + (s.created || '?')"></span>
+            </div>
+            <div class="actions">
+              <button class="secondary small" @click="startEdit(s)">编辑</button>
+              <button class="secondary small" @click="toggleSite(s)"
+                      x-text="s.enabled ? '停用' : '启用'"></button>
+              <button class="danger small" @click="deleteSite(s)">删除</button>
+            </div>
+            <template x-if="editing === s.domain">
+              <div style="margin-top:0.65rem; padding-top:0.65rem; border-top:1px dashed var(--border);">
+                <label>新上游</label>
+                <input type="text" x-model="editUpstream" />
+                <div style="margin-top:0.5rem;">
+                  <button @click="saveEdit(s)" :disabled="editBusy">保存</button>
+                  <button class="secondary" @click="editing=null">取消</button>
+                </div>
+              </div>
+            </template>
+          </div>
+        </template>
+      </div>
+
+      <!-- ④ Key management (admin only) -->
+      <template x-if="role === 'admin'">
+        <div class="card">
+          <h2>④ 密钥管理
+            <span class="pill muted small" x-text="(keys.length || 0) + ' 个'"></span>
+            <span class="right">
+              <button class="secondary small" @click="loadKeys()">刷新</button>
+            </span>
+          </h2>
+          <template x-if="keys.length === 0">
+            <p class="muted small">暂无密钥。</p>
+          </template>
+          <template x-for="k in keys" :key="k.id">
+            <div class="site">
+              <div class="site-head">
+                <span class="dom" x-text="k.id"></span>
+                <span class="pill muted small" x-text="k.role"></span>
+                <code class="small" x-text="k.key"></code>
+                <span class="muted small" x-text="k.note"></span>
+                <span class="right" x-show="k.id !== 'admin'">
+                  <button class="danger small" @click="deleteKey(k)">删除</button>
+                </span>
+              </div>
+            </div>
+          </template>
+
+          <div style="margin-top:1rem; padding-top:0.75rem; border-top:1px dashed var(--border);">
+            <h3 style="margin:0 0 0.5rem 0; font-size:0.95rem;">添加密钥</h3>
+            <template x-if="newKeyResult">
+              <div class="ok-banner">
+                密钥已创建，请复制并分发给用户：<br/>
+                <strong>ID: </strong><code x-text="newKeyResult.id"></code> &nbsp;
+                <strong>密钥: </strong><code x-text="newKeyResult.key"></code>
+                <button class="secondary small" style="margin-left:0.5rem;" @click="newKeyResult=null">关闭</button>
+              </div>
+            </template>
+            <div class="row3">
+              <div>
+                <label>用户 ID</label>
+                <input type="text" x-model="newKeyId" placeholder="user01" />
+              </div>
+              <div>
+                <label>备注</label>
+                <input type="text" x-model="newUserNote" placeholder="用户名称" />
+              </div>
+              <div>
+                <label>&nbsp;</label>
+                <button @click="createKey()" :disabled="newKeyBusy || !newKeyId" x-text="newKeyBusy ? '创建中…' : '创建'"></button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+  </template>
+
+</div>
+
+<script>
+function app() {
+  return {
+    // state
+    loggedIn: false, loginToken: '', loginErr: '', loginBusy: false,
+    version: '', edgeIp: '', keyId: '', role: '',
+    cfStatus: { configured: false, masked: '' }, cfEdit: false, cfTokenInput: '', cfBusy: false,
+    zones: [],
+    newSub: '', newZone: '', newUpstream: '', creating: false,
+    sites: [], sitesWarnings: [],
+    editing: null, editUpstream: '', editBusy: false,
+    flash: '', flashOk: false,
+    // key management (admin)
+    keys: [], newKeyId: '', newUserNote: '', newKeyBusy: false, newKeyResult: null,
+
+    flashIt(msg, ok=true) { this.flash = msg; this.flashOk = ok; setTimeout(()=>this.flash='', 5000); },
+
+    async boot() {
+      // Try healthz + whoami to detect existing cookie session.
+      try {
+        const h = await fetch('/api/healthz').then(r=>r.json()); this.version = h.version || '';
+      } catch(e) {}
+      try {
+        const w = await fetch('/api/whoami', { credentials: 'include' });
+        if (w.ok) {
+          const d = await w.json();
+          this.keyId = d.key_id || '';
+          this.role = d.role || '';
+          this.loggedIn = true;
+          await this.refresh();
+        }
+      } catch(e) {}
+    },
+
+    async doLogin() {
+      this.loginBusy = true; this.loginErr = '';
+      try {
+        const res = await fetch('/api/login', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          credentials: 'include',
+          body: JSON.stringify({ token: this.loginToken })
+        });
+        if (!res.ok) {
+          const j = await res.json().catch(()=>({error: res.statusText}));
+          this.loginErr = j.error || ('登录失败: ' + res.status);
+          return;
+        }
+        const d = await res.json();
+        this.keyId = d.key_id || '';
+        this.role = d.role || '';
+        this.loginToken = '';
+        this.loggedIn = true;
+        await this.refresh();
+      } catch(e) { this.loginErr = String(e); }
+      finally { this.loginBusy = false; }
+    },
+
+    async logout() {
+      // No server-side session; just clear cookie + reload.
+      document.cookie = 'vps-relay-auth=; Path=/; Max-Age=0; SameSite=Lax';
+      this.loggedIn = false;
+      this.keyId = '';
+      this.role = '';
+    },
+
+    async refresh() {
+      await this.loadCfStatus();
+      await this.loadEdge();
+      if (this.cfStatus.configured) {
+        await this.loadZones();
+      }
+      await this.reloadSites();
+      if (this.role === 'admin') {
+        await this.loadKeys();
+      }
+    },
+
+    async loadCfStatus() {
+      const r = await fetch('/api/cf-token/status', { credentials: 'include' });
+      if (r.ok) this.cfStatus = await r.json();
+    },
+    async loadEdge() {
+      try { const r = await fetch('/api/edge', { credentials: 'include' });
+            if (r.ok) { const j = await r.json(); this.edgeIp = j.ipv4 || ''; } } catch(e) {}
+    },
+    async loadZones() {
+      const r = await fetch('/api/zones', { credentials: 'include' });
+      if (r.ok) this.zones = await r.json();
+    },
+
+    async saveCfToken() {
+      if (!this.cfTokenInput) return;
+      this.cfBusy = true;
+      try {
+        const r = await fetch('/api/cf-token', {
+          method:'PUT', headers:{'Content-Type':'application/json'},
+          credentials: 'include',
+          body: JSON.stringify({ token: this.cfTokenInput })
+        });
+        if (!r.ok) { const j = await r.json().catch(()=>({})); this.flashIt(j.error || 'save failed', false); return; }
+        this.cfTokenInput = ''; this.cfEdit = false;
+        this.flashIt('Cloudflare Token 已保存');
+        await this.loadCfStatus(); await this.loadZones();
+      } finally { this.cfBusy = false; }
+    },
+
+    async reloadSites() {
+      const r = await fetch('/api/sites', { credentials: 'include' });
+      if (r.ok) { const j = await r.json(); this.sites = j.sites || []; this.sitesWarnings = j.warnings || []; if (j.edge_ip) this.edgeIp = j.edge_ip; }
+    },
+
+    fullDomain() { return this.newSub.trim() + '.' + this.newZone.trim(); },
+
+    async createSite() {
+      this.creating = true;
+      try {
+        const r = await fetch('/api/sites', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          credentials: 'include',
+          body: JSON.stringify({ domain: this.fullDomain(), upstream: this.newUpstream.trim() })
+        });
+        if (!r.ok) { const j = await r.json().catch(()=>({})); this.flashIt(j.error || 'create failed', false); return; }
+        this.flashIt('站点 ' + this.fullDomain() + ' 创建成功');
+        this.newSub = ''; this.newUpstream = '';
+        await this.reloadSites();
+      } finally { this.creating = false; }
+    },
+
+    startEdit(s) { this.editing = s.domain; this.editUpstream = s.upstream; },
+    async saveEdit(s) {
+      this.editBusy = true;
+      try {
+        const r = await fetch('/api/sites/' + encodeURIComponent(s.domain), {
+          method: 'PUT', headers: {'Content-Type':'application/json'},
+          credentials: 'include',
+          body: JSON.stringify({ upstream: this.editUpstream.trim() })
+        });
+        if (!r.ok) { const j = await r.json().catch(()=>({})); this.flashIt(j.error || 'edit failed', false); return; }
+        this.flashIt(s.domain + ' upstream 已更新');
+        this.editing = null;
+        await this.reloadSites();
+      } finally { this.editBusy = false; }
+    },
+
+    async toggleSite(s) {
+      const r = await fetch('/api/sites/' + encodeURIComponent(s.domain) + '/toggle', {
+        method: 'POST', credentials: 'include'
+      });
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.flashIt(j.error || 'toggle failed', false); return; }
+      this.flashIt((s.enabled ? '已停用 ' : '已启用 ') + s.domain);
+      await this.reloadSites();
+    },
+
+    async deleteSite(s) {
+      if (!confirm('删除 ' + s.domain + '?\n会清掉 DNS、证书和反代配置。')) return;
+      const r = await fetch('/api/sites/' + encodeURIComponent(s.domain), {
+        method: 'DELETE', credentials: 'include'
+      });
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.flashIt(j.error || '删除失败', false); return; }
+      this.flashIt('已删除 ' + s.domain);
+      await this.reloadSites();
+    },
+
+    // ---- key management ----
+
+    async loadKeys() {
+      const r = await fetch('/api/keys', { credentials: 'include' });
+      if (r.ok) this.keys = await r.json();
+    },
+
+    async createKey() {
+      if (!this.newKeyId) return;
+      this.newKeyBusy = true;
+      try {
+        const r = await fetch('/api/keys', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          credentials: 'include',
+          body: JSON.stringify({ id: this.newKeyId.trim(), role: 'user', note: this.newUserNote.trim() })
+        });
+        if (!r.ok) { const j = await r.json().catch(()=>({})); this.flashIt(j.error || '创建失败', false); return; }
+        const d = await r.json();
+        this.newKeyResult = d;
+        this.newKeyId = ''; this.newUserNote = '';
+        this.flashIt('密钥 ' + d.id + ' 已创建');
+        await this.loadKeys();
+      } finally { this.newKeyBusy = false; }
+    },
+
+    async deleteKey(k) {
+      if (!confirm('删除密钥 ' + k.id + '？该用户将无法登录。')) return;
+      const r = await fetch('/api/keys/' + encodeURIComponent(k.id), {
+        method: 'DELETE', credentials: 'include'
+      });
+      if (!r.ok) { const j = await r.json().catch(()=>({})); this.flashIt(j.error || '删除失败', false); return; }
+      this.flashIt('已删除密钥 ' + k.id);
+      await this.loadKeys();
+    },
+  };
+}
+</script>
+</body>
+</html>
