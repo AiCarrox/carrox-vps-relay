@@ -25,6 +25,7 @@ services:
       # Project config — keys.json + per-user CF tokens (read-write, keys auto-managed)
       - /etc/vps-relay:/etc/vps-relay
       # acme.sh account + certificate state, persisted across container restarts
+      # (per-user homes live under users/<key_id>/ inside this volume)
       - acme_data:/root/.acme.sh
     environment:
       - TZ=Asia/Shanghai

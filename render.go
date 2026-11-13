@@ -17,13 +17,34 @@ import (
 )
 
 const (
-	templatePath = "/opt/vps-relay/templates/site.conf.tmpl"
-	nginxPidPath = "/usr/local/nginx/logs/nginx.pid"
-	hostNginxConf = "/usr/local/nginx/conf/nginx.conf"
+	templatePath    = "/opt/vps-relay/templates/site.conf.tmpl"
+	nginxPidPath    = "/usr/local/nginx/logs/nginx.pid"
+	hostNginxConf   = "/usr/local/nginx/conf/nginx.conf"
 	hostNginxPrefix = "/usr/local/nginx"
 )
 
+const (
+	// Hosts set up by the carrox-vps-base nginx scripts keep the HTTPS listen
+	// directives in this snippet, so that sites keep working whether nginx owns
+	// :443 directly or sits behind the 443 SNI split (stream + ssl_preread,
+	// e.g. sharing the port with Reality). Sites include it when it exists.
+	httpsListenSnippet = "/usr/local/nginx/conf/snippets/https_listen.conf"
+
+	// The image's nginx (used only for `nginx -t`) ships stream as a dynamic
+	// module; the host config may contain a stream {} block.
+	streamModulePath = "/usr/lib/nginx/modules/ngx_stream_module.so"
+)
+
+// httpsListen returns the listen directive(s) for a TLS server block.
+func httpsListen() string {
+	if _, err := os.Stat(httpsListenSnippet); err == nil {
+		return "include " + httpsListenSnippet + ";"
+	}
+	return "listen 443 ssl;\n    listen [::]:443 ssl;"
+}
+
 type renderCtx struct {
+	HTTPSListen    string
 	Domain         string
 	Upstream       string
 	UpstreamScheme string
@@ -78,6 +99,7 @@ func renderSite(meta SiteMeta) ([]byte, error) {
 		return nil, fmt.Errorf("read template: %w", err)
 	}
 	ctx := renderCtx{
+		HTTPSListen:    httpsListen(),
 		Domain:         meta.Domain,
 		Upstream:       meta.Upstream,
 		UpstreamScheme: scheme,
@@ -109,9 +131,11 @@ func confPath(domain string) string {
 func nginxSyntaxCheck() error {
 	ctx, cancel := contextWithTimeout(8 * time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx,
-		"nginx", "-p", hostNginxPrefix, "-c", hostNginxConf, "-t",
-	)
+	args := []string{"-p", hostNginxPrefix, "-c", hostNginxConf, "-t"}
+	if _, err := os.Stat(streamModulePath); err == nil {
+		args = append([]string{"-g", "load_module " + streamModulePath + ";"}, args...)
+	}
+	cmd := exec.CommandContext(ctx, "nginx", args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("nginx -t failed: %v\n%s", err, string(out))

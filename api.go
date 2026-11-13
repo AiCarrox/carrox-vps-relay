@@ -31,12 +31,15 @@ func registerAPIRoutes(mux *http.ServeMux) {
 
 	mux.HandleFunc("GET /api/zones", auth(zonesList))
 	mux.HandleFunc("GET /api/edge", auth(edgeInfo))
+	mux.HandleFunc("GET /api/panel", auth(panelInfo))
 
 	mux.HandleFunc("GET /api/sites", auth(sitesList))
 	mux.HandleFunc("POST /api/sites", auth(sitesCreate))
 	mux.HandleFunc("POST /api/sites/adopt", auth(sitesAdopt))
 	mux.HandleFunc("PUT /api/sites/{domain}", auth(sitesEdit))
 	mux.HandleFunc("POST /api/sites/{domain}/toggle", auth(sitesToggle))
+	mux.HandleFunc("POST /api/sites/{domain}/enable", auth(sitesEnable))
+	mux.HandleFunc("POST /api/sites/{domain}/disable", auth(sitesDisable))
 	mux.HandleFunc("DELETE /api/sites/{domain}", auth(sitesDelete))
 
 	// Key management (admin only).
@@ -95,10 +98,18 @@ func cfTokenSave(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "save config: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"ok":     true,
 		"masked": maskToken(body.Token),
-	})
+	}
+	// First admin token on a panel that install.sh set up as HTTP-only:
+	// issue the panel's own certificate and switch it to HTTPS in the background.
+	if authIsAdmin(r) && panelHTTPSPending() {
+		go ensurePanelHTTPS()
+		resp["panel_https"] = "issuing"
+		resp["panel_domain"] = panelDomain()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ---------------- Zones ----------------
@@ -363,7 +374,21 @@ func sitesEdit(w http.ResponseWriter, r *http.Request) {
 
 // --- toggle (enable/disable) ---
 
-func sitesToggle(w http.ResponseWriter, r *http.Request) {
+func sitesToggle(w http.ResponseWriter, r *http.Request) { siteSetEnabled(w, r, nil) }
+
+func sitesEnable(w http.ResponseWriter, r *http.Request) {
+	want := true
+	siteSetEnabled(w, r, &want)
+}
+
+func sitesDisable(w http.ResponseWriter, r *http.Request) {
+	want := false
+	siteSetEnabled(w, r, &want)
+}
+
+// siteSetEnabled flips the site when want is nil, otherwise moves it to the
+// requested state and is a no-op if it is already there (safe to retry).
+func siteSetEnabled(w http.ResponseWriter, r *http.Request, want *bool) {
 	domain := strings.ToLower(r.PathValue("domain"))
 	if err := validateDomain(domain); err != nil {
 		writeErr(w, http.StatusBadRequest, err.Error())
@@ -392,6 +417,10 @@ func sitesToggle(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusForbidden, "无权操作此站点")
 		return
 	}
+	if curEnabled := fromPath == enabled; want != nil && *want == curEnabled {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "enabled": curEnabled, "changed": false})
+		return
+	}
 	if err := os.Rename(fromPath, newPath); err != nil {
 		writeErr(w, http.StatusInternalServerError, "重命名失败: "+err.Error())
 		return
@@ -409,6 +438,7 @@ func sitesToggle(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":      true,
 		"enabled": !strings.HasSuffix(newPath, ".disabled"),
+		"changed": true,
 	})
 }
 
@@ -489,8 +519,26 @@ func sitesAdopt(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "conf_path required")
 		return
 	}
-	if !strings.HasPrefix(req.ConfPath, confDir+"/") {
-		writeErr(w, http.StatusBadRequest, "conf_path must live in "+confDir)
+	// Resolve "..", then require a regular *.conf file directly inside conf.d —
+	// a prefix test alone lets conf.d/../../etc/... through.
+	req.ConfPath = filepath.Clean(req.ConfPath)
+	if filepath.Dir(req.ConfPath) != confDir || !strings.HasSuffix(req.ConfPath, ".conf") {
+		writeErr(w, http.StatusBadRequest, "conf_path must be a .conf file directly inside "+confDir)
+		return
+	}
+	if filepath.Base(req.ConfPath) == "relay-panel.conf" {
+		writeErr(w, http.StatusBadRequest, "面板自身的配置不能被接管")
+		return
+	}
+	if fi, err := os.Lstat(req.ConfPath); err != nil {
+		writeErr(w, http.StatusNotFound, "读取源配置失败: "+err.Error())
+		return
+	} else if !fi.Mode().IsRegular() {
+		writeErr(w, http.StatusBadRequest, "conf_path 不是普通文件")
+		return
+	}
+	if _, err := readSiteMeta(req.ConfPath); err == nil {
+		writeErr(w, http.StatusConflict, "该配置已是托管站点，无需接管")
 		return
 	}
 	src, err := os.ReadFile(req.ConfPath)

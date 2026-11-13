@@ -1,0 +1,22 @@
+# Same intent as .gitignore plus build artefacts irrelevant inside image
+.git/
+.gitignore
+.dockerignore
+*.md
+LICENSE
+/vps-relay
+*.exe
+/dist/
+/bin/
+/vendor/
+.vscode/
+.idea/
+.DS_Store
+.env
+.env.*
+*.token
+admin-token
+config.env
+*.log
+/data/
+/docs/

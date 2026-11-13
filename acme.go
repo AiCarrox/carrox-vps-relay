@@ -1,5 +1,5 @@
 // Wraps the container-internal /usr/local/bin/relay-acme shim for cert ops.
-// Each user gets an isolated acme.sh home at /root/.acme.sh-{keyID}/.
+// Each user gets an isolated acme.sh home at /root/.acme.sh/users/{keyID}/.
 package main
 
 import (
@@ -15,8 +15,22 @@ const relayAcmePath = "/usr/local/bin/relay-acme"
 const autoRenewInterval = 12 * time.Hour
 const renewThresholdDays = 30
 
+// acmeHome lives inside /root/.acme.sh, the persisted volume, so that per-user
+// account and renewal state survives the container being recreated.
 func acmeHome(keyID string) string {
-	return fmt.Sprintf("/root/.acme.sh-%s", keyID)
+	return "/root/.acme.sh/users/" + keyID
+}
+
+// acmeRenewOrIssue renews a certificate, falling back to a fresh issue when
+// this acme home does not know the domain — its state was lost, or the
+// certificate was installed by other means.
+func acmeRenewOrIssue(domain, cfTok, keyID string) error {
+	err := acmeRenew(domain, cfTok, keyID)
+	if err == nil {
+		return nil
+	}
+	log.Printf("[auto-renew] %s: renew failed, trying a fresh issue: %v", domain, err)
+	return acmeIssue(domain, cfTok, keyID)
 }
 
 // ensureAcmeHome creates the per-user acme.sh home directory and symlinks
@@ -86,6 +100,7 @@ func autoRenewLoop() {
 }
 
 func renewExpiringCerts() {
+	renewPanelCert()
 	sites, _, err := scanSites("", true)
 	if err != nil {
 		log.Printf("[auto-renew] scan sites: %v", err)
@@ -105,7 +120,7 @@ func renewExpiringCerts() {
 			continue
 		}
 		log.Printf("[auto-renew] %s: %d days left, renewing…", s.Domain, s.CertDaysLeft)
-		if err := acmeRenew(s.Domain, cfTok, owner); err != nil {
+		if err := acmeRenewOrIssue(s.Domain, cfTok, owner); err != nil {
 			log.Printf("[auto-renew] %s: renew failed: %v", s.Domain, err)
 		} else {
 			log.Printf("[auto-renew] %s: renewed OK", s.Domain)

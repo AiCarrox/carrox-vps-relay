@@ -1,6 +1,9 @@
 {{- /*
   vps-relay — managed site template.
   Variables (rendered by main.go):
+    .HTTPSListen     : listen directive(s) for the TLS server — either
+                       `listen 443 ssl; listen [::]:443 ssl;` or an include of
+                       the host's snippets/https_listen.conf when it exists
     .Domain          : accelerated domain
     .Upstream        : full upstream URL (kept for relay-meta JSON)
     .UpstreamScheme  : http | https
@@ -25,8 +28,7 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    {{.HTTPSListen}}
     http2 on;
     server_name {{.Domain}};
 
@@ -35,7 +37,11 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
 
     location / {
-        proxy_pass {{.UpstreamScheme}}://{{.UpstreamHost}}:{{.UpstreamPort}};
+        # Variableize proxy_pass so a NXDOMAIN upstream cannot fail `nginx -t`
+        # at startup and bring down the whole panel + every other site.
+        # DNS is resolved lazily via the http{} `resolver` directive.
+        set $relay_upstream {{.UpstreamScheme}}://{{.UpstreamHost}}:{{.UpstreamPort}};
+        proxy_pass $relay_upstream$request_uri;
         proxy_http_version 1.1;
 
         # Upstream Host: use upstream host name if it's a domain,

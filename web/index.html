@@ -131,6 +131,23 @@
             </div>
           </div>
         </template>
+        <!-- Panel HTTPS + MCP endpoint (only when deployed with --domain) -->
+        <template x-if="panel.domain">
+          <p class="muted small" style="margin-top:0.65rem;">
+            <template x-if="panel.state === 'https'">
+              <span>面板 HTTPS 已启用。MCP 端点：<code x-text="panel.mcp_url"></code>（请求头 <code>Authorization: Bearer &lt;密钥&gt;</code>）</span>
+            </template>
+            <template x-if="panel.state === 'issuing'">
+              <span>正在为面板域名签发证书，约 1-3 分钟后自动切换到 HTTPS…</span>
+            </template>
+            <template x-if="panel.state === 'http'">
+              <span>面板当前为 HTTP。管理员保存 Cloudflare Token 后会自动切换到 HTTPS，之后才能使用 MCP。</span>
+            </template>
+            <template x-if="panel.state === 'error'">
+              <span>面板切换 HTTPS 失败：<span x-text="panel.error"></span></span>
+            </template>
+          </p>
+        </template>
       </div>
 
       <!-- ② New reverse-proxy -->
@@ -290,6 +307,7 @@ function app() {
     loggedIn: false, loginToken: '', loginErr: '', loginBusy: false,
     version: '', edgeIp: '', keyId: '', role: '',
     cfStatus: { configured: false, masked: '' }, cfEdit: false, cfTokenInput: '', cfBusy: false,
+    panel: { domain: '', state: 'none', https: false, error: '', mcp_url: '' }, panelTimer: null,
     zones: [],
     newSub: '', newZone: '', newUpstream: '', creating: false,
     sites: [], sitesWarnings: [],
@@ -351,6 +369,8 @@ function app() {
     async refresh() {
       await this.loadCfStatus();
       await this.loadEdge();
+      await this.loadPanel();
+      if (this.panel.state === 'issuing') this.watchPanel();
       if (this.cfStatus.configured) {
         await this.loadZones();
       }
@@ -368,6 +388,32 @@ function app() {
       try { const r = await fetch('/api/edge', { credentials: 'include' });
             if (r.ok) { const j = await r.json(); this.edgeIp = j.ipv4 || ''; } } catch(e) {}
     },
+    async loadPanel() {
+      const r = await fetch('/api/panel', { credentials: 'include' });
+      if (r.ok) this.panel = Object.assign({ error: '', mcp_url: '' }, await r.json());
+    },
+    // Poll while the panel certificate is being issued. Once nginx switches to
+    // HTTPS, plain-HTTP requests start failing (301 to another origin), so a
+    // failed poll on an http:// page is also treated as "switched".
+    watchPanel() {
+      if (this.panelTimer) return;
+      const stop = () => { clearInterval(this.panelTimer); this.panelTimer = null; };
+      const goHttps = () => { stop(); location.href = 'https://' + this.panel.domain + '/'; };
+      this.panelTimer = setInterval(async () => {
+        try {
+          await this.loadPanel();
+        } catch (e) {
+          if (location.protocol === 'http:' && this.panel.domain) goHttps();
+          return;
+        }
+        if (this.panel.state === 'https') {
+          if (location.protocol === 'http:') goHttps(); else stop();
+        } else if (this.panel.state !== 'issuing') {
+          stop();
+          if (this.panel.state === 'error') this.flashIt('面板切换 HTTPS 失败: ' + this.panel.error, false);
+        }
+      }, 5000);
+    },
     async loadZones() {
       const r = await fetch('/api/zones', { credentials: 'include' });
       if (r.ok) this.zones = await r.json();
@@ -383,8 +429,15 @@ function app() {
           body: JSON.stringify({ token: this.cfTokenInput })
         });
         if (!r.ok) { const j = await r.json().catch(()=>({})); this.flashIt(j.error || 'save failed', false); return; }
+        const saved = await r.json().catch(()=>({}));
         this.cfTokenInput = ''; this.cfEdit = false;
-        this.flashIt('Cloudflare Token 已保存');
+        if (saved.panel_https === 'issuing') {
+          this.flashIt('Cloudflare Token 已保存，正在为面板签发证书并切换 HTTPS…');
+          this.panel.state = 'issuing';
+          this.watchPanel();
+        } else {
+          this.flashIt('Cloudflare Token 已保存');
+        }
         await this.loadCfStatus(); await this.loadZones();
       } finally { this.cfBusy = false; }
     },

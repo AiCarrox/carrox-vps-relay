@@ -17,6 +17,7 @@ set -euo pipefail
 log() { printf '[install] %s\n' "$*"; }
 
 PANEL_DOMAIN=""
+PANEL_SCHEME=http
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -69,7 +70,55 @@ ensure_connection_upgrade_map() {
   fi
 }
 
+# Managed sites resolve their upstream at request time (variable proxy_pass),
+# which needs an http-level `resolver`. Add one only if none is configured.
+ensure_resolver() {
+  if grep -qE '^[[:space:]]*resolver[[:space:]]' "$NGX_CONF"; then
+    log "resolver already present"
+    return 0
+  fi
+
+  log "patching nginx.conf with resolver (fallback)"
+  local backup="${NGX_CONF}.bak.$(date +%Y%m%d%H%M%S)-resolver"
+  cp "$NGX_CONF" "$backup"
+  python3 "$HERE/deploy/patch-nginx-resolver.py" "$NGX_CONF"
+
+  if /usr/local/nginx/sbin/nginx -p /usr/local/nginx -c conf/nginx.conf -t >/dev/null 2>&1; then
+    /usr/local/nginx/sbin/nginx -s reload
+  else
+    cp "$backup" "$NGX_CONF"
+    echo "ERROR: nginx -t failed after resolver patch attempt; original restored from $backup." >&2
+    exit 1
+  fi
+}
+
+# The panel's HTTPS vhost and every managed site are served by nginx on 443.
+# If some other process (e.g. xray/Reality) already holds it, nginx cannot bind
+# and nothing would work — stop before touching anything. Nginx itself holding
+# 443 is fine, which includes a host already set up with a 443 SNI split.
+check_port_443() {
+  if ! command -v ss >/dev/null 2>&1; then
+    log "WARN: 'ss' not found — skipping the port 443 check"
+    return 0
+  fi
+  local listeners others
+  listeners=$(ss -H -ltnp 'sport = :443' 2>/dev/null || true)
+  [ -n "$listeners" ] || return 0
+  others=$(printf '%s\n' "$listeners" | grep -oE '\("[^"]+"' | tr -d '("' | sort -u | grep -vx 'nginx' || true)
+  [ -n "$others" ] || return 0
+
+  echo "ERROR: 443 端口已被非 Nginx 进程占用: $(printf '%s' "$others" | tr '\n' ' ')" >&2
+  echo "  vps-relay 的面板 HTTPS 和所有站点都需要由 Nginx 监听 443。" >&2
+  echo "  不要直接停掉该服务；常见做法是在宿主机做 443 SNI 分流，让 Nginx 接管 443" >&2
+  echo "  并按 SNI 转发给它（见 README「与其他服务共用 443」），完成后重跑本脚本。" >&2
+  echo "  当前监听情况：" >&2
+  printf '%s\n' "$listeners" | sed 's/^/    /' >&2
+  exit 1
+}
+
 # --- 1. Prereq checks ------------------------------------------------------
+check_port_443
+
 if [ ! -x /usr/local/nginx/sbin/nginx ]; then
   echo "ERROR: /usr/local/nginx/sbin/nginx not found — install nginx 1.28.x first." >&2
   exit 1
@@ -99,6 +148,7 @@ fi
 
 # --- 2. nginx.conf fallback patch ------------------------------------------
 ensure_connection_upgrade_map
+ensure_resolver
 
 # --- 3. /etc/vps-relay/ ----------------------------------------------------
 install -d -m 0750 /etc/vps-relay
@@ -108,22 +158,64 @@ install -d -m 0755 /usr/local/nginx/conf/conf.d
 # --- 4. Optional panel vhost ------------------------------------------------
 if [ -n "$PANEL_DOMAIN" ]; then
   PANEL_CONF=/usr/local/nginx/conf/conf.d/relay-panel.conf
-  if find /usr/local/nginx/conf/conf.d -maxdepth 1 -type f -name '*.conf' | xargs -r grep -n -E "server_name[[:space:]]+.*\\b${PANEL_DOMAIN//./\\.}\\b" >/dev/null 2>&1; then
-    if [ ! -f "$PANEL_CONF" ] || ! grep -q "server_name $PANEL_DOMAIN;" "$PANEL_CONF"; then
-      echo "ERROR: panel domain already used by another nginx conf: $PANEL_DOMAIN" >&2
+
+  # Conflict check: any *other* top-level conf (what nginx actually includes)
+  # naming this exact domain in a server_name directive. The loop simply does
+  # not run on an empty conf.d, and an exact-token match keeps
+  # my-relay.example.com from colliding with relay.example.com.
+  PANEL_DOMAIN_RE="server_name[[:space:]]([^;]*[[:space:]])?${PANEL_DOMAIN//./\\.}[[:space:]]*(;|[[:space:]])"
+  for f in /usr/local/nginx/conf/conf.d/*.conf; do
+    [ -f "$f" ] || continue
+    [ "$f" = "$PANEL_CONF" ] && continue
+    if grep -qE "$PANEL_DOMAIN_RE" "$f"; then
+      echo "ERROR: panel domain already used by another nginx conf: $PANEL_DOMAIN ($f)" >&2
       exit 1
     fi
+  done
+
+  # Keep HTTPS on re-runs: once the panel certificate exists (issued by the
+  # panel itself after the admin saves a Cloudflare token), render the TLS vhost.
+  PANEL_TMPL="$HERE/templates/panel.conf.tmpl"
+  PANEL_SSL_DIR="/usr/local/nginx/conf/ssl/$PANEL_DOMAIN"
+  if [ -s "$PANEL_SSL_DIR/fullchain.pem" ] && [ -s "$PANEL_SSL_DIR/key.pem" ]; then
+    PANEL_TMPL="$HERE/templates/panel-ssl.conf.tmpl"
+    PANEL_SCHEME=https
   fi
 
-  bash "$HERE/deploy/render-panel-conf.sh" "$PANEL_DOMAIN" "$HERE/templates/panel.conf.tmpl" > "${PANEL_CONF}.new"
-  mv "${PANEL_CONF}.new" "$PANEL_CONF"
-  if /usr/local/nginx/sbin/nginx -p /usr/local/nginx -c conf/nginx.conf -t >/dev/null 2>&1; then
-    /usr/local/nginx/sbin/nginx -s reload
+  # Render → swap in → nginx -t; on failure put the previous conf back.
+  PANEL_BAK="${PANEL_CONF}.bak.install"
+  rm -f "$PANEL_BAK"
+  if [ -f "$PANEL_CONF" ]; then
+    cp -p "$PANEL_CONF" "$PANEL_BAK"
+  fi
+  # Hosts prepared by the carrox-vps-base nginx scripts keep the HTTPS listen
+  # directives in a snippet (direct :443, or 127.0.0.1:8443 behind the 443 SNI
+  # split). Use it when present so the panel follows the host's mode.
+  HTTPS_LISTEN_SNIPPET=/usr/local/nginx/conf/snippets/https_listen.conf
+  if [ -f "$HTTPS_LISTEN_SNIPPET" ]; then
+    PANEL_HTTPS_LISTEN="include $HTTPS_LISTEN_SNIPPET;"
   else
-    rm -f "${PANEL_CONF}.new"
-    echo "ERROR: nginx -t failed for panel conf." >&2
+    PANEL_HTTPS_LISTEN=$'listen 443 ssl;\n    listen [::]:443 ssl;'
+  fi
+  bash "$HERE/deploy/render-panel-conf.sh" "$PANEL_DOMAIN" "$PANEL_TMPL" "$PANEL_HTTPS_LISTEN" > "${PANEL_CONF}.new"
+  mv "${PANEL_CONF}.new" "$PANEL_CONF"
+  if NGX_TEST_OUT=$(/usr/local/nginx/sbin/nginx -p /usr/local/nginx -c conf/nginx.conf -t 2>&1); then
+    /usr/local/nginx/sbin/nginx -s reload
+    rm -f "$PANEL_BAK"
+  else
+    if [ -f "$PANEL_BAK" ]; then
+      mv "$PANEL_BAK" "$PANEL_CONF"
+    else
+      rm -f "$PANEL_CONF"
+    fi
+    echo "ERROR: nginx -t failed for panel conf; previous state restored." >&2
+    printf '%s\n' "$NGX_TEST_OUT" >&2
     exit 1
   fi
+
+  # Tells the container which domain is the panel, so it can issue the panel
+  # certificate and switch this vhost to HTTPS after the first CF token is saved.
+  printf '%s\n' "$PANEL_DOMAIN" > /etc/vps-relay/panel-domain
 fi
 
 # --- 5. Build + up ---------------------------------------------------------
@@ -145,7 +237,8 @@ for i in $(seq 1 10); do
   sleep 1
 done
 
-ADMIN_KEY=$(docker logs vps-relay 2>&1 | grep -oP '已自动生成管理员密钥：\s*\K\S+' || true)
+# The key is logged on the line *after* the announcement.
+ADMIN_KEY=$(docker logs vps-relay 2>&1 | grep -A1 '已自动生成管理员密钥' | tail -n 1 | awk '{print $NF}' || true)
 EDGE_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || echo '<未检测到>')
 
 echo ""
@@ -154,7 +247,7 @@ echo "  vps-relay 部署完成"
 echo "============================================"
 echo ""
 if [ -n "$PANEL_DOMAIN" ]; then
-  echo "  面板地址:   http://$PANEL_DOMAIN"
+  echo "  面板地址:   $PANEL_SCHEME://$PANEL_DOMAIN"
 else
   echo "  面板地址:   http://127.0.0.1:8787"
 fi
@@ -171,6 +264,36 @@ if [ -n "$ADMIN_KEY" ]; then
 else
   echo "  管理员密钥已在之前生成，请查看 /etc/vps-relay/keys.json"
   echo "  或运行: docker logs vps-relay 2>&1 | grep 密钥"
+fi
+
+# This script cannot tell whether the provider blocks inbound 80 (a local curl
+# only hits loopback), so always show the fallback that does not depend on it.
+print_tunnel_hint() {
+  local conn="${SSH_CONNECTION:-}"
+  local ssh_port="${conn##* }"
+  [ -n "$ssh_port" ] || ssh_port=22
+  echo "  $1"
+  echo "  在你自己的电脑上执行（SSH 隧道）："
+  echo "    ssh -p $ssh_port -L 8787:127.0.0.1:8787 root@$EDGE_IP"
+  echo "  保持该窗口不关，然后用浏览器打开 http://127.0.0.1:8787"
+}
+
+echo ""
+if [ -n "$PANEL_DOMAIN" ]; then
+  if [ "$PANEL_SCHEME" != "https" ]; then
+    echo "  首次配置（仅此一次需要网页）："
+    echo "    用管理员密钥登录面板并保存 Cloudflare API Token。"
+    echo "    保存后面板会自动签发自身证书并切换到 https://$PANEL_DOMAIN（约 1-3 分钟）。"
+    echo ""
+    print_tunnel_hint "如果从外网打不开 http://$PANEL_DOMAIN（部分机房拦截入站 80 端口，服务器本机 curl 仍会成功）："
+    echo ""
+  fi
+  echo "  之后可通过 MCP 让 AI 操作（以 Claude Code 为例，整条命令写在一行）："
+  echo "    claude mcp add --transport http vps-relay https://$PANEL_DOMAIN/mcp --header \"Authorization: Bearer <密钥>\""
+else
+  print_tunnel_hint "面板只监听服务器本机，要从自己电脑的浏览器访问："
+  echo ""
+  echo "  MCP 端点: http://127.0.0.1:8787/mcp（仅本机；公网使用请带 --domain 部署）"
 fi
 
 echo ""
